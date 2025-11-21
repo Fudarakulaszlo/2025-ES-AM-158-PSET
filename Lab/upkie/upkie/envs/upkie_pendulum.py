@@ -156,7 +156,7 @@ class UpkiePendulum(gym.Wrapper):
         self.env = env
         self.fall_pitch = fall_pitch
         self.left_wheeled = left_wheeled
-        self.env.max_time_steps = 300
+        self.env.max_time_steps = 1000
 
     def __get_env_observation(self, spine_observation: dict) -> np.ndarray:
         r"""!
@@ -313,14 +313,56 @@ class UpkiePendulum(gym.Wrapper):
               particular the full observation dictionary coming from the spine.
         """
         spine_action = self.__get_spine_action(action)
-        _, reward, terminated, truncated, info = self.env.step(spine_action)
+        _, _, terminated, truncated, info = self.env.step(spine_action)
         spine_observation = info["spine_observation"]
         observation = self.__get_env_observation(spine_observation)
+
+        # 1. Termination Conditions
+        # Detect fall (pitch too high)
         if self.__detect_fall(spine_observation):
             terminated = True
+        
+        # Detect position limit (robot drove too far)
+        # We enforce a limit of 3.0 meters to keep the robot in a reasonable workspace
+        # and prevent it from cheating by driving infinitely fast to balance.
+        position = observation[1]
+        if abs(position) > 3.0:
+            logger.warning(
+                "Position limit reached (pos=%.2f m)", position
+            )
+            terminated = True
+
+        # Check time limit
         self.time_stamp += 1
         if self.env.max_time_steps is not None:
             if self.time_stamp >= self.env.max_time_steps:
                 truncated = True
-                print("Max time steps reached.")
+
+        # 2. Reward Function
+        # We use a Gaussian kernel for the reward variables.
+        # The reward is in [0, 1], maximized when all variables are 0.
+        
+        pitch = observation[0]
+        angular_velocity = observation[2]
+
+        # Pitch reward: Standard deviation ~ 0.25 rad (approx 15 deg)
+        # This is the primary objective.
+        reward_pitch = np.exp(-15.0 * pitch**2)
+
+        # Position reward: Standard deviation ~ 1.0 m
+        # This is a secondary objective to keep the robot near origin.
+        reward_position = np.exp(-1.0 * position**2)
+
+        # Angular velocity reward: Standard deviation ~ 2.0 rad/s
+        # This encourages smooth motions.
+        reward_velocity = np.exp(-0.1 * angular_velocity**2)
+
+        # We weight the pitch reward highest, as balancing is the priority.
+        # We add a small constant to differentiate "surviving" from falling.
+        reward = 1.0 * reward_pitch + 0.1 * reward_position + 0.1 * reward_velocity
+        
+        # If we fell or went out of bounds, give 0 reward for this step (or negative)
+        if terminated:
+             reward = 0.0
+
         return observation, reward, terminated, truncated, info
