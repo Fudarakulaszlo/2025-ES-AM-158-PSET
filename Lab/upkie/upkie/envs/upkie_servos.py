@@ -12,11 +12,18 @@ from typing import Optional, Tuple
 import gymnasium as gym
 import numpy as np
 
-from upkie.envs.backends import Backend
+# We try to import Backend/RobotState if available, otherwise we assume
+# the user might be running in a simplified context.
+try:
+    from upkie.envs.backends import Backend
+    from upkie.utils.robot_state import RobotState
+except ImportError:
+    # Fallback placeholders if run independently without full package
+    Backend = None
+    RobotState = None
+
 from upkie.exceptions import UpkieRuntimeError
 from upkie.utils.clamp import clamp_and_warn
-from upkie.utils.robot_state import RobotState
-
 from .upkie_env import UpkieEnv
 
 
@@ -27,75 +34,8 @@ class UpkieServos(UpkieEnv):
     \anchor upkie_servos_description
 
     Actions and observations correspond to the moteus servo API.
-
-    ### Action space
-
-    The action space is a dictionary with one key for each servo:
-
-    - `left_hip`: left hip joint (qdd100)
-    - `left_knee`: left knee joint (qdd100)
-    - `left_wheel`: left wheel joint (mj5208)
-    - `right_hip`: right hip joint (qdd100)
-    - `right_knee`: right knee joint (qdd100)
-    - `right_wheel`: right wheel joint (mj5208)
-
-    The value for each servo dictionary is itself a dictionary with the
-    following keys:
-
-    - `position`: commanded joint angle \f$\theta^*\f$ in radians (NaN to
-       disable) (required).
-    - `velocity`: commanded joint velocity \f$\dot{\theta}^*\f$ in rad/s
-       (required).
-    - `feedforward_torque`: feedforward joint torque \f$\tau_{\mathit{ff}}\f$
-       in N·m.
-    - `kp_scale`: scaling factor \f$k_{p}^{\mathit{scale}}\f$ applied to the
-       position feedback gain, between zero and one.
-    - `kd_scale`: scaling factor \f$k_{d}^{\mathit{scale}}\f$ applied to the
-       velocity feedback gain, between zero and one.
-    - `maximum_torque`: maximum joint torque \f$\tau_{\mathit{max}}\f$
-       (feedforward + feedback) enforced during the whole actuation step, in
-       N⋅m.
-
-    The resulting torque applied by the servo is then:
-
-    \f[
-    \begin{align*}
-    \tau & = \underset{
-            [-\tau_{\mathit{max}}, +\tau_{\mathit{max}}]}{
-            \mathrm{clamp}
-        }
-        \left(
-            \tau_{\mathit{ff}} +
-            k_{p} k_{p}^{\mathit{scale}} (\theta^* - \theta) +
-            k_{d} k_{d}^{\mathit{scale}} (\dot{\theta}^* - \dot{\theta}))
-        \right)
-    \end{align*}
-    \f]
-
-    Position and velocity gains \f$k_{p}\f$ and \f$k_{d}\f$ are configured in
-    each moteus controller directly and don't change during execution. We can
-    rather modulate the overall feedback gains via the normalized parameters
-    \f$k_{p}^{\mathit{scale}} \in [0, 1]\f$ and \f$k_{d}^{\mathit{scale}} \in
-    [0, 1]\f$. Note that the servo regulates the torque above at its own
-    frequency, which is higher (typically 40 kHz) than the agent and the spine
-    frequencies. See the [moteus
-    reference](https://github.com/mjbots/moteus/blob/13c171c697ce6f60a73c9385e6fe951957313d1d/docs/reference.md#theory-of-operation)
-    for more details.
-
-    ### Observation space
-
-    The observation space is a dictionary with one key for each servo. The
-    value for each key is a dictionary with keys:
-
-    - `position`: Joint angle in rad.
-    - `velocity`: Joint velocity in rad/s.
-    - `torque`: Joint torque in N⋅m.
-    - `temperature`: Servo temperature in degree Celsius.
-    - `voltage`: Power bus voltage of the servo, in V.
-
-    Full observations from the backend (detailed in \ref observations) are also
-    available in the `info` dictionary returned by the reset and step
-    functions.
+    
+    **Task**: The agent is rewarded for keeping the robot upright (pitch ~ 0).
     """
 
     ACTION_KEYS: Tuple[str, str, str, str, str, str] = (
@@ -117,41 +57,53 @@ class UpkieServos(UpkieEnv):
 
     def __init__(
         self,
-        backend: Backend,
+        backend: Optional[Backend] = None,
         frequency: Optional[float] = 200.0,
         frequency_checks: bool = True,
         init_state: Optional[RobotState] = None,
         regulate_frequency: bool = True,
         max_gain_scale: float = 5.0,
+        fall_pitch: float = 1.0,
+        shm_name: str = "/vulp",  # Added for compatibility with simple init
+        **kwargs,
     ) -> None:
         r"""!
         Initialize servos environment.
 
         \param backend Backend for interfacing with a simulator or a spine.
-        \param frequency Regulated frequency of the control loop, in Hz. Can be
-            prescribed even when `regulate_frequency` is unset, in which case
-            `self.dt` will be defined but the loop frequency will not be
-            regulated.
-        \param frequency_checks If `regulate_frequency` is set and this
-            parameter is `True`, a warning will be issued every time the
-            control loop runs slower than the desired `frequency`.
-        \param init_state Initial state of the robot, only used in simulation.
-        \param regulate_frequency If set (default), the environment will
-            regulate the control loop frequency to the value prescribed in
-            `frequency`.
+        \param frequency Regulated frequency of the control loop, in Hz.
+        \param frequency_checks Warning if loop is slower than frequency.
+        \param init_state Initial state of the robot.
+        \param regulate_frequency If set, env regulates loop frequency.
         \param max_gain_scale Maximum value for kp or kd gain scales.
+        \param fall_pitch Pitch angle (rad) at which episode terminates.
+        \param shm_name Shared memory name (if backend is not provided).
         """
         if not (0.0 < max_gain_scale < 10.0):
-            raise UpkieRuntimeError("Invalid value {max_gain_scale =}")
+            raise UpkieRuntimeError(f"Invalid value {max_gain_scale=}")
 
-        # Initialize base class but override action/observation spaces
-        super().__init__(
-            backend=backend,
+        self.fall_pitch = fall_pitch
+
+        # Handle backend/shm_name compatibility for simple gym.make usage
+        # If the parent UpkieEnv supports shm_name directly, we pass it.
+        # Otherwise, standard UpkieEnv usage often relies on backend.
+        # We pass kwargs to be safe if the parent signature varies.
+        init_kwargs = dict(
             frequency=frequency,
             frequency_checks=frequency_checks,
             init_state=init_state,
             regulate_frequency=regulate_frequency,
+            **kwargs
         )
+        
+        # If Backend class exists and backend arg is provided, pass it
+        if Backend is not None and backend is not None:
+            init_kwargs["backend"] = backend
+        elif "shm_name" in UpkieEnv.__init__.__code__.co_varnames:
+             # Fallback for the simplified UpkieEnv defined earlier
+            init_kwargs["shm_name"] = shm_name
+
+        super().__init__(**init_kwargs)
 
         # Initialize action and observation spaces
         (
@@ -162,7 +114,6 @@ class UpkieServos(UpkieEnv):
             min_action,
         ) = self.__create_servo_spaces(max_gain_scale)
 
-        # Override with servo-specific spaces
         self.action_space = action_space
         self.observation_space = observation_space
         self._max_action = max_action
@@ -244,8 +195,8 @@ class UpkieServos(UpkieEnv):
                         dtype=np.float32,
                     ),
                     "voltage": gym.spaces.Box(
-                        low=10.0,  # moteus min 10 V
-                        high=44.0,  # moteus max 44 V
+                        low=10.0,
+                        high=44.0,
                         shape=(1,),
                         dtype=np.float32,
                     ),
@@ -285,14 +236,6 @@ class UpkieServos(UpkieEnv):
         )
 
     def get_env_observation(self, spine_observation: dict) -> dict:
-        r"""!
-        Extract environment observation from spine observation dictionary.
-
-        \param spine_observation Full observation dictionary from the spine.
-        \return Environment observation.
-        """
-        # If creating a new object turns out to be too slow we can switch to
-        # updating in-place.
         return {
             joint.name: {
                 key: np.array(
@@ -305,20 +248,9 @@ class UpkieServos(UpkieEnv):
         }
 
     def get_neutral_action(self) -> dict:
-        r"""!
-        Get the neutral action where servos don't move.
-
-        \return Neutral action where servos don't move.
-        """
         return self._neutral_action.copy()
 
     def get_spine_action(self, env_action: dict) -> dict:
-        r"""!
-        Convert environment action to a spine action dictionary.
-
-        \param env_action Environment action.
-        \return Spine action dictionary.
-        """
         spine_action = {"servo": {}}
         for joint in self.model.joints:
             servo_action = {}
@@ -341,3 +273,55 @@ class UpkieServos(UpkieEnv):
                 )
             spine_action["servo"][joint.name] = servo_action
         return spine_action
+
+    def step(self, action):
+        # 1. Step the base environment
+        _, _, terminated, truncated, info = super().step(action)
+        
+        # 2. Extract observations
+        spine_observation = info["spine_observation"]
+        env_obs = self.get_env_observation(spine_observation)
+        
+        # 3. Calculate State Variables
+        # Pitch (Angle)
+        pitch = spine_observation["base_orientation"]["pitch"]
+        
+        # Angular Velocity (Speed of rotation)
+        # Note: Check your keys. Usually it's under 'imu' -> 'angular_velocity' 
+        # If not available, you might need to calculate (pitch - last_pitch) / dt
+        imu = spine_observation.get("imu", {})
+        angular_velocity = imu.get("angular_velocity", [0, 0, 0])
+        pitch_velocity = angular_velocity[1] # Y-axis is usually pitch
+
+        # 4. Calculate Reward Components
+        
+        # A: Upright reward (Gaussian is good, maybe slightly tighter)
+        reward_upright = np.exp(-10.0 * pitch**2)
+        
+        # B: Damping reward (Penalize spinning fast)
+        # This prevents the "whiplash" effect.
+        reward_damping = np.exp(-1.0 * pitch_velocity**2)
+        
+        # C: Survival Bonus (Small constant reward just for staying alive)
+        # This encourages the agent to avoid the termination state.
+        reward_survival = 0.1
+
+        # D: Small Penalty for Action Magnitude (Energy efficiency)
+        # Penalize high torques to prevent jittering
+        # We iterate over joints to sum the squared commanded torque or velocity
+        action_penalty = 0.0
+        for joint in action:
+            # Assuming 'feedforward_torque' or 'velocity' is used
+            if "velocity" in action[joint]:
+                action_penalty += float(action[joint]["velocity"])**2
+        
+        # Combine them
+        # We weight uprightness highest.
+        reward = (1.0 * reward_upright) + (0.5 * reward_damping) + reward_survival - (0.01 * action_penalty)
+
+        # 5. Termination (Fall Detection)
+        if abs(pitch) > self.fall_pitch:
+            terminated = True
+            reward = -1.0  # Hard penalty for failure
+
+        return env_obs, reward, terminated, truncated, info

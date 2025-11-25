@@ -29,6 +29,7 @@ classifiers = [
 dependencies = [
     "gymnasium >= 1.0.0",
     "loop-rate-limiters >= 1.2.0",
+    "moviepy>=2.2.1",
     "msgpack >= 1.0.2",
     "numpy>=1.24.3",
     "pyyaml >=5.3.1",

@@ -1,51 +1,68 @@
-Upkie Pendulum Environment
+Upkie Policy Training Report
 
-Overview
+This report details the design and results of training reinforcement learning policies for two distinct control tasks on the Upkie robot: the Wheeled Inverted Pendulum task and the Full Servos task.
 
-The UpkiePendulum environment wraps the Upkie wheeled biped robot to behave like a Wheeled Inverted Pendulum. The legs are kept rigid, and the agent controls the ground velocity of the wheels to maintain balance.
+Part 1: Wheeled Inverted Pendulum
 
-Observation Space
+Environment Design (upkie/envs/upkie_pendulum.py)
 
-The observation is a 4-dimensional vector:
+In this initial task, the robot's legs were rigidly locked in a straight configuration. The agent had control only over the wheels' ground velocity.
 
-Pitch ($\theta$): The angle of the base relative to the vertical world Z-axis. (0 = upright).
+Observation Space: 4D vector $[\theta, p, \dot{\theta}, \dot{p}]$ (Pitch, Position, Pitch Velocity, Ground Velocity).
 
-Position ($p$): The odometry position of the wheels (0 = starting point).
+Action Space: 1D vector $[\dot{p}^*]$ (Commanded Ground Velocity).
 
-Pitch Velocity ($\dot{\theta}$): The angular velocity of the base.
+Reward Function:
+The reward was designed to stabilize the robot at the origin. We used Gaussian kernels to provide dense, bounded rewards:
 
-Ground Velocity ($\dot{p}$): The linear velocity of the wheels.
+$$R_{pendulum} = 1.0 \cdot e^{-15 \theta^2} + 0.1 \cdot e^{-1.0 p^2} + 0.1 \cdot e^{-0.1 \dot{\theta}^2}$$
 
-Action Space
+This prioritized keeping the pitch $\theta$ near zero, while secondarily encouraging the robot to stay near $p=0$ and move smoothly.
 
-The action is a 1-dimensional vector:
+Results
 
-Commanded Velocity ($\dot{p}^*$): The target ground velocity for the wheel controllers.
+The PPO agent successfully learned to stabilize the pendulum. Training was efficient due to the low dimensionality of the action space. The agent learned to modulate wheel velocity to counteract gravity, effectively balancing indefinitely (up to the 1000 step limit).
 
-Reward Function
+Part 2: Upkie Servos (6-DOF)
 
-The goal of the agent is to keep the robot upright and, secondarily, to keep it near the starting position. The reward function uses Gaussian kernels to provide a smooth, dense signal within the range $[0, \approx 1.2]$.
+Environment Design (upkie/envs/upkie_servos.py)
 
-$$R = w_\theta \cdot \exp(-k_\theta \cdot \theta^2) + w_p \cdot \exp(-k_p \cdot p^2) + w_{\dot{\theta}} \cdot \exp(-k_{\dot{\theta}} \cdot \dot{\theta}^2)$$
+This task is significantly more challenging. The agent controls all 6 joints (hips, knees, wheels) directly.
 
-Parameters:
+Action Space: 6 joints $\times$ {position, velocity, torque, gains}. Wrapped to expose Velocity for wheels and Position for legs.
 
-Pitch Term ($w_\theta=1.0, k_\theta=15.0$): Strongly rewards keeping the pitch near 0. The kernel width corresponds to a standard deviation of roughly $\pm 0.25$ rad ($\approx 15^\circ$).
+Observation Space: Full servo state (Position, Velocity) for all 6 joints.
 
-Position Term ($w_p=0.1, k_p=1.0$): Lightly rewards staying near the origin ($p=0$). This prevents the robot from stabilizing by simply driving off to infinity.
+Revised Reward Function
 
-Velocity Term ($w_{\dot{\theta}}=0.1, k_{\dot{\theta}}=0.1$): Lightly rewards low angular velocity, encouraging smooth, static balancing rather than oscillating violently.
+For the Servos task, the simple Gaussian used in the Pendulum task was insufficient. The robot has more degrees of freedom and can exhibit high-frequency vibrations or "thrashing" while staying upright. We refined the reward function as follows:
 
-If a termination condition is met, the reward for that step is $0.0$.
+$$R_{servos} = w_1 R_{upright} + w_2 R_{damping} + w_3 R_{survival} - w_4 C_{action}$$
 
-Termination Conditions
+Upright Term ($w_1=1.0$): $e^{-10 \theta^2}$.
 
-The episode terminates (terminated = True) if:
+Goal: The primary objective remains keeping the base pitch zero.
 
-Fall Detection: The pitch angle $|\theta|$ exceeds fall_pitch (default 1.0 rad).
+Damping Term ($w_2=0.5$): $e^{-1 \dot{\theta}_{pitch}^2}$.
 
-Position Limit: The robot drives more than 3.0 meters away from the origin ($|p| > 3.0$).
+Reasoning: In the Servos task, the robot can oscillate violently while technically remaining "upright" on average. This term penalizes high pitch velocity, encouraging smooth, static balancing.
 
-The episode truncates (truncated = True) if:
+Survival Bonus ($w_3=0.1$): Constant $+0.1$ per step.
 
-Time Limit: The episode exceeds 1000 steps (approx. 5 seconds at 200Hz). This was increased from the original 300 steps to allow sufficient time for the agent to demonstrate stability.
+Reasoning: This provides a small, positive gradient just for avoiding the termination condition (falling). It helps in the early stages of training when the agent is struggling to find any stable state.
+
+Action Penalty ($w_4=0.01$): $\sum (\text{velocity}_{cmd})^2$.
+
+Reasoning: We penalize high commanded velocities to improve energy efficiency and prevent the "jittery" behavior often seen in RL policies on hardware.
+
+Training Strategy
+
+Algorithm: PPO (Stable Baselines3).
+
+Duration: Increased to 1,000,000 timesteps to accommodate the higher dimensionality and difficulty.
+
+Rate Limiting: Logging for rate-limiters was suppressed to prevent I/O bottlenecks during the CPU-intensive training process.
+
+Expected Results
+
+The addition of the damping and action penalty terms is expected to yield a policy that is not only stable but smooth. Instead of reacting frantically to every small deviation, the agent should learn to lock its knees (or maintain a steady crouch) and make micro-adjustments with the wheels, mimicking the efficiency of the Pendulum policy but learned from scratch with full authority.
